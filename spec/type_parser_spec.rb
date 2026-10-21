@@ -7,6 +7,17 @@ def n(type, *children)
 end
 
 RSpec.describe Parlour::TypeParser do
+  def fix_heredoc(x)
+    lines = x.lines
+    /^( *)/ === lines.first
+    indent_amount = $1.length
+    lines.map do |line|
+      /^ +$/ === line[0...indent_amount] \
+        ? line[indent_amount..-1]
+        : line
+    end.join.rstrip
+  end
+
   context Parlour::TypeParser::NodePath do
     let(:subject) { described_class.new([1, 2, 3, 4]) }
     let(:empty) { described_class.new([]) }
@@ -198,6 +209,16 @@ RSpec.describe Parlour::TypeParser do
       expect(meth.parameters.length).to eq 1
       expect(meth.parameters.first).to have_attributes(name: 'x',
         type: 'String')
+    end
+
+    it 'returns nothing for a sig followed by another sig' do
+      instance = described_class.from_source('(test)', <<-RUBY)
+        sig { params(x: Integer).returns(String) }
+        sig { params(x: String).returns(Integer) }
+        def foo(x); end
+      RUBY
+
+      expect(instance.parse_sig_into_methods(Parlour::TypeParser::NodePath.new([0]))).to eq []
     end
 
     it 'errors on a self.x method within an eigenclass' do
@@ -673,6 +694,34 @@ RSpec.describe Parlour::TypeParser do
         class_method: false)
     end
 
+    it 'uses the last of several stacked sigs' do
+      instance = described_class.from_source('(test)', <<-RUBY)
+        class A
+          sig { returns(Integer) }
+          def before; end
+
+          sig { params(root: Integer).returns(T::Enumerator[Integer]) }
+          sig { params(root: String).returns(String) }
+          sig { params(root: Integer, blk: T.proc.params(arg0: Integer).void).void }
+          def scan(root, &blk); end
+
+          sig { returns(String) }
+          def after; end
+        end
+      RUBY
+
+      root = instance.parse_all
+      a = root.children.only
+      expect(a.children.map(&:name)).to eq ['before', 'scan', 'after']
+
+      before, scan, after = *a.children
+      expect(before).to have_attributes(return_type: 'Integer')
+      expect(after).to have_attributes(return_type: 'String')
+      expect(scan).to have_attributes(return_type: nil)
+      expect(scan.parameters.map(&:name)).to eq ['root', '&blk']
+      expect(scan.parameters.map(&:type)).to eq ['Integer', 'T.proc.params(arg0: Integer).void']
+    end
+
     it 'supports expansion of names like A::B::C' do
       instance = described_class.from_source('(test)', <<-RUBY)
         module A::B::C
@@ -722,6 +771,13 @@ RSpec.describe Parlour::TypeParser do
     expect(id).to have_attributes(name: 'id',
       return_type: 'T.type_parameter(:A)',
       type_parameters: [:A, :B])
+
+    id.generalize_from_rbi!
+    expect(id.return_type).to eq Parlour::Types::TypeVariable.new('A')
+    expect(id.parameters.map(&:type)).to eq [
+      Parlour::Types::TypeVariable.new('A'),
+      Parlour::Types::TypeVariable.new('B'),
+    ]
   end
 
   context 'structs' do
@@ -975,6 +1031,51 @@ EOF
     expect(foo).to have_attributes(name: "Foo", type: "String")
   end
 
+  it 'parses type members' do
+    instance = described_class.from_source('(test)', <<-RUBY)
+      class Box
+        extend T::Generic
+        Elem = type_member
+      end
+    RUBY
+
+    root = instance.parse_all
+    expect(root.children.length).to eq 1
+
+    box = root.children.first
+    expect(box).to be_a Parlour::RbiGenerator::ClassNamespace
+    expect(box).to have_attributes(name: 'Box', superclass: nil, final: false, abstract: false)
+
+    elem = box.type_members.first
+    expect(elem).to be_a Parlour::RbiGenerator::TypeMember
+    expect(elem).to have_attributes(name: "Elem")
+  end
+
+  it 'round-trips a class combining a type member and a method-scoped type parameter' do
+    opts = Parlour::Options.new(break_params: 4, tab_size: 2, sort_namespaces: false)
+    source = fix_heredoc(<<-RUBY)
+      class Box
+        extend T::Generic
+        Elem = type_member
+
+        sig { params(x: Elem).void }
+        def set(x); end
+
+        sig { returns(Elem) }
+        def get; end
+
+        sig { type_parameters(:U).params(y: T.type_parameter(:U)).returns(T.type_parameter(:U)) }
+        def identity(y); end
+      end
+    RUBY
+
+    root = described_class.from_source('(test)', source).parse_all
+    root.generalize_from_rbi!
+
+    box = root.children.first
+    expect(box.generate_rbi(0, opts).join("\n")).to eq source
+  end
+
   describe 'parsing of RBI types into Types::Type' do
     def t(s)
       i = described_class.from_source('(test)', s)
@@ -1032,6 +1133,10 @@ EOF
 
     it 'parses booleans' do
       expect(t('T::Boolean')).to eq Parlour::Types::Boolean.new
+    end
+
+    it 'parses type parameter references' do
+      expect(t('T.type_parameter(:U)')).to eq Parlour::Types::TypeVariable.new('U')
     end
 
     it 'parses complex nested types' do

@@ -379,6 +379,15 @@ module Parlour
             name: T.must(name).to_s,
             type: T.must(node_to_s(body.to_a[2])),
           )]
+        elsif body.type == :send && body.to_a[0].nil? && body.to_a[1] == :type_member
+          # A type member looks like:
+          #   (casgn nil :Elem (send nil :type_member))
+          # Bounds/variance (`type_member {{ fixed: ... }}`) aren't supported;
+          # that's a block node here, so it falls through to a plain Constant.
+          [Parlour::RbiGenerator::TypeMember.new(
+            generator,
+            name: T.must(name).to_s,
+          )]
         else
           heredocs = find_heredocs(body)
           [Parlour::RbiGenerator::Constant.new(
@@ -538,6 +547,12 @@ module Parlour
       # A :def node represents a definition like "def x; end"
       # A :defs node represents a definition like "def self.x; end"
       def_node = path.sibling(1).traverse(ast)
+
+      # Overloaded methods have several sigs in a row before one definition.
+      # Parlour's methods hold one signature, so only the sig next to the
+      # definition is used; earlier sigs are skipped.
+      return [] if sig_node?(def_node)
+
       if def_node.type == :send && [:def, :defs].include?(def_node.children.last.type)
         # bypass inline modifier (e.g. "private")
         def_node = def_node.children.last
@@ -889,7 +904,7 @@ module Parlour
           parse_err 'no argument to T.type_parameter', node if args.nil? || args.empty?
           parse_err 'too many arguments to T.type_parameter', node unless args.length == 1
           parse_err 'expected T.type_parameter to be passed a symbol', node unless T.must(args.first).type == :sym
-          Types::Raw.new(T.must(args.first.to_a[0].to_s))
+          Types::TypeVariable.new(T.must(args.first.to_a[0].to_s))
         when :class_of
           parse_err 'no argument to T.class_of', node if args.nil? || args.empty?
           parse_err 'too many arguments to T.class_of', node unless args.length == 1
